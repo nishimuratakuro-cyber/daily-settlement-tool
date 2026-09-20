@@ -1,0 +1,425 @@
+"""スロット立ち回り支援ツール（Streamlit）。
+
+計算はすべて ``slot_core`` 側にあり、ここは入出力だけを担当する。
+起動:
+    streamlit run slot/app.py
+"""
+
+from __future__ import annotations
+
+import csv
+import io
+import math
+import os
+import sys
+
+import pandas as pd
+import streamlit as st
+
+sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
+
+from slot_core import bayes, ev, ledger  # noqa: E402
+
+DATA_DIR = os.path.join(os.path.dirname(os.path.abspath(__file__)), "data")
+MACHINES_CSV = os.path.join(DATA_DIR, "machines_sample.csv")
+LEDGER_CSV = os.path.join(DATA_DIR, "ledger_sample.csv")
+
+st.set_page_config(page_title="スロット立ち回り支援ツール", page_icon="🎰", layout="wide")
+
+
+# --- 共通パーツ -------------------------------------------------------------
+def exchange_input(key_prefix: str) -> ev.Exchange:
+    """交換率の入力欄。等価 / 非等価を切り替える。"""
+    mode = st.radio(
+        "交換率",
+        ["等価（20円）", "非等価（枚数指定）"],
+        horizontal=True,
+        key=f"{key_prefix}_mode",
+    )
+    if mode.startswith("等価"):
+        return ev.Exchange()
+    medals = st.number_input(
+        "100円で交換できる枚数",
+        min_value=5.0,
+        max_value=10.0,
+        value=5.6,
+        step=0.1,
+        key=f"{key_prefix}_medals",
+        help="5.6枚交換なら 5.6。換金単価は 100 ÷ この枚数 で計算されます",
+    )
+    exchange = ev.Exchange.from_medals_per_100yen(medals)
+    st.caption(f"換金単価 {exchange.payout_yen:.2f} 円/枚（貸出 {exchange.rental_yen:.0f} 円/枚）")
+    return exchange
+
+
+def probability_input(label: str, default_denominator: float, key: str) -> float:
+    """1/N 形式で確率を入力させる。"""
+    denominator = st.number_input(
+        label, min_value=1.0, max_value=100_000.0, value=default_denominator, step=1.0, key=key
+    )
+    return 1.0 / denominator
+
+
+def histogram(values: list[float], bins: int = 30) -> pd.DataFrame:
+    """ヒストグラムを DataFrame にする（matplotlib を使わずに描くため）。"""
+    low, high = min(values), max(values)
+    if math.isclose(low, high):
+        return pd.DataFrame({"件数": [len(values)]}, index=[f"{low:.0f}"])
+    width = (high - low) / bins
+    counts = [0] * bins
+    for value in values:
+        index = min(bins - 1, int((value - low) / width))
+        counts[index] = counts[index] + 1
+    labels = [f"{low + width * i:,.0f}" for i in range(bins)]
+    return pd.DataFrame({"件数": counts}, index=labels)
+
+
+# --- 1. 設定判別 -------------------------------------------------------------
+def page_setting_estimation() -> None:
+    st.header("🎯 設定判別（ベイズ推定）")
+    st.caption(
+        "小役・ボーナスの観測回数から、各設定の事後確率を計算します。"
+        "機種の解析値は CSV で差し替えてください（同梱のサンプルはダミー値です）。"
+    )
+
+    uploaded = st.file_uploader("機種テーブル CSV", type="csv", key="machine_csv")
+    try:
+        if uploaded is not None:
+            text = uploaded.getvalue().decode("utf-8-sig")
+            machines = bayes.parse_machines(csv.DictReader(io.StringIO(text)))
+        else:
+            machines = bayes.load_machines(MACHINES_CSV)
+            st.info("サンプルの機種テーブルを使用中です（数値はダミー）。", icon="ℹ️")
+    except (ValueError, KeyError) as error:
+        st.error(f"機種テーブルを読めませんでした: {error}")
+        return
+
+    machine_name = st.selectbox("機種", list(machines))
+    spec = machines[machine_name]
+
+    st.subheader("観測値の入力")
+    total_games = st.number_input("総ゲーム数", min_value=1, max_value=200_000, value=8000, step=100)
+
+    counts: dict[str, float] = {}
+    columns = st.columns(min(4, max(1, len(spec.events))))
+    for index, event in enumerate(spec.event_names()):
+        with columns[index % len(columns)]:
+            counts[event] = st.number_input(
+                event, min_value=0, max_value=int(total_games), value=0, step=1, key=f"count_{event}"
+            )
+
+    with st.expander("ホールの設定配分（事前確率）を指定する"):
+        st.caption("相対値でかまいません。0 にすると『その設定は使われない』として除外します。")
+        prior_columns = st.columns(len(spec.settings))
+        prior = []
+        for index, setting in enumerate(spec.settings):
+            with prior_columns[index]:
+                prior.append(
+                    st.number_input(setting, min_value=0.0, value=1.0, step=0.1, key=f"prior_{setting}")
+                )
+        if sum(prior) <= 0:
+            st.warning("事前確率の合計が 0 です。一様分布として扱います。")
+            prior = None
+
+    if sum(counts.values()) == 0:
+        st.info("観測回数を入力すると判別を開始します。")
+        return
+
+    try:
+        result = bayes.posterior(spec, counts, int(total_games), prior=prior)
+    except (ValueError, KeyError) as error:
+        st.error(f"計算できませんでした: {error}")
+        return
+
+    best_setting, best_probability = result.best()
+    high_probability = bayes.high_setting_probability(result)
+    expected_rate = bayes.expected_payout_rate(result, spec)
+
+    st.subheader("判別結果")
+    metric_columns = st.columns(3)
+    metric_columns[0].metric("最有力", best_setting, delta=f"{best_probability:.1%}")
+    metric_columns[1].metric("高設定期待度（設定4以上）", f"{high_probability:.1%}")
+    metric_columns[2].metric(
+        "期待機械割", "—" if math.isnan(expected_rate) else f"{expected_rate * 100:.1f}%"
+    )
+
+    frame = pd.DataFrame(result.as_rows()).set_index("設定")
+    st.bar_chart(frame["事後確率"])
+    st.dataframe(
+        frame.style.format({"事前確率": "{:.1%}", "対数尤度": "{:.1f}", "事後確率": "{:.2%}"}),
+        use_container_width=True,
+    )
+
+    if not math.isnan(expected_rate):
+        if expected_rate >= 1.0:
+            st.success(f"期待機械割 {expected_rate * 100:.1f}% — 続行が有利な水準です。")
+        else:
+            st.warning(f"期待機械割 {expected_rate * 100:.1f}% — 現時点では続行が不利な水準です。")
+
+    st.subheader("実測値と理論値")
+    observed = pd.DataFrame(bayes.observed_rates(counts, int(total_games))).set_index("事象")
+    theoretical = pd.DataFrame(
+        {setting: {event: 1 / spec.events[event][index] for event in spec.events}
+         for index, setting in enumerate(spec.settings)}
+    )
+    st.dataframe(
+        observed.join(theoretical).style.format("{:.1f}", subset=list(spec.settings)).format(
+            {"実測確率": "{:.4f}", "実測1/N": "{:.1f}", "回数": "{:.0f}"}
+        ),
+        use_container_width=True,
+    )
+    st.caption("表の設定列は理論上の 1/N。実測1/N がどの列に近いかが判別の直感的な根拠になります。")
+
+
+# --- 2. 天井狙い -------------------------------------------------------------
+def page_ceiling() -> None:
+    st.header("⏱ 天井狙いの期待値")
+    st.caption(
+        "通常時の当選率を一定とみなす近似モデルです。ゾーンやモードが濃い機種ほど誤差が出ます。"
+    )
+
+    left, right = st.columns(2)
+    with left:
+        ceiling_games = st.number_input("天井ゲーム数", min_value=1, max_value=10_000, value=1000, step=50)
+        hit_probability = probability_input("通常時の当選確率 1/N", 300.0, "ceiling_hit")
+        current_games = st.number_input(
+            "現在のゲーム数", min_value=0, max_value=int(ceiling_games), value=700, step=10
+        )
+    with right:
+        average_payout = st.number_input("自力当選時の平均獲得枚数", min_value=0.0, value=500.0, step=50.0)
+        ceiling_payout = st.number_input("天井到達時の平均獲得枚数", min_value=0.0, value=800.0, step=50.0)
+        coin_persistence = st.number_input(
+            "コイン持ち（50枚あたりのゲーム数）", min_value=1.0, max_value=100.0, value=25.0, step=0.5
+        )
+    exchange = exchange_input("ceiling")
+
+    model = ev.CeilingModel(
+        ceiling_games=int(ceiling_games),
+        hit_probability=hit_probability,
+        average_payout=average_payout,
+        ceiling_payout=ceiling_payout,
+        net_loss_per_game=50.0 / coin_persistence,
+    )
+    result = ev.ceiling_ev(model, int(current_games), exchange=exchange)
+    breakeven = ev.breakeven_start_games(model)
+
+    metric_columns = st.columns(4)
+    metric_columns[0].metric("期待差枚", f"{result['期待差枚']:+,.0f} 枚")
+    metric_columns[1].metric("期待収支", f"{result['期待収支(円)']:+,.0f} 円")
+    metric_columns[2].metric("天井到達率", f"{result['天井到達率']:.1%}")
+    metric_columns[3].metric(
+        "狙い目ライン", "なし" if breakeven is None else f"{breakeven:,}G〜"
+    )
+
+    if breakeven is None:
+        st.error("この条件では天井直前でも期待値がプラスになりません。")
+    elif current_games >= breakeven:
+        st.success(f"{breakeven:,}G 以上なら期待値プラス。現在 {int(current_games):,}G は打てるゾーンです。")
+    else:
+        st.warning(f"期待値がプラスになるのは {breakeven:,}G から。現在 {int(current_games):,}G では見送りです。")
+
+    detail = pd.DataFrame(
+        {
+            "項目": list(result),
+            "値": [result[key] for key in result],
+        }
+    ).set_index("項目")
+    st.dataframe(detail.style.format({"値": "{:,.2f}"}), use_container_width=True)
+
+    step = max(1, int(ceiling_games) // 100)
+    curve = pd.DataFrame(
+        {
+            "現在ゲーム数": list(range(0, int(ceiling_games), step)),
+            "期待差枚": [
+                ev.ceiling_ev(model, games)["期待差枚"] for games in range(0, int(ceiling_games), step)
+            ],
+        }
+    ).set_index("現在ゲーム数")
+    st.subheader("ゲーム数別の期待差枚")
+    st.line_chart(curve)
+
+
+# --- 3. シミュレーション -----------------------------------------------------
+def page_simulation() -> None:
+    st.header("📐 差枚シミュレーション")
+    st.caption("『機械割はプラスなのに負ける』がどれくらい起きるかを、分布として確認します。")
+
+    left, right = st.columns(2)
+    with left:
+        hit_probability = probability_input("通常時の初当り確率 1/N", 300.0, "sim_hit")
+        average_payout = st.number_input("初当り1回あたりの平均獲得枚数", min_value=1.0, value=500.0, step=50.0)
+        payout_sd = st.number_input("獲得枚数のばらつき（標準偏差）", min_value=0.0, value=600.0, step=50.0)
+    with right:
+        coin_persistence = st.number_input(
+            "コイン持ち（50枚あたりのゲーム数）", min_value=1.0, max_value=100.0, value=25.0, step=0.5, key="sim_coin"
+        )
+        normal_games = st.number_input("通常時の消化ゲーム数", min_value=1, max_value=50_000, value=5000, step=500)
+        bankroll = st.number_input("持ち込み資金（円）", min_value=0, value=50_000, step=10_000)
+    exchange = exchange_input("sim")
+
+    trials = st.slider("試行回数", min_value=1_000, max_value=50_000, value=20_000, step=1_000)
+    seed = st.number_input("乱数シード（同じ値なら結果が再現します）", min_value=0, value=42, step=1)
+
+    model = ev.SessionModel(
+        hit_probability=hit_probability,
+        average_payout=average_payout,
+        payout_sd=payout_sd,
+        net_loss_per_game=50.0 / coin_persistence,
+    )
+    diffs = ev.simulate_diffs(model, int(normal_games), trials=int(trials), seed=int(seed))
+    stats = ev.session_stats(diffs, exchange=exchange, bankroll_yen=bankroll or None)
+
+    metric_columns = st.columns(4)
+    metric_columns[0].metric("期待差枚", f"{stats['期待差枚']:+,.0f} 枚")
+    metric_columns[1].metric("期待収支", f"{stats['期待収支(円)']:+,.0f} 円")
+    metric_columns[2].metric("勝率", f"{stats['勝率']:.1%}")
+    metric_columns[3].metric(
+        "資金ショート確率", f"{stats.get('資金ショート確率', float('nan')):.1%}" if bankroll else "—"
+    )
+
+    if not exchange.is_even:
+        st.info(
+            f"交換率による目減り: {stats['交換率による目減り(円)']:+,.0f} 円。"
+            "非等価では差枚がプラスマイナスゼロでも現金収支はマイナスになります。",
+            icon="ℹ️",
+        )
+    if bankroll:
+        st.caption("資金ショート確率は終了時点で必要な現金が資金を超えた割合です。途中経過はさらに沈むため、実際の破産確率はこれより高くなります。")
+
+    st.subheader("差枚の分布")
+    st.bar_chart(histogram(diffs))
+
+    quantiles = pd.DataFrame(
+        {
+            "分位点": ["下位5%", "下位25%", "中央値", "上位75%", "上位95%"],
+            "差枚": [
+                stats["下位5%差枚"],
+                stats["下位25%差枚"],
+                stats["中央値差枚"],
+                stats["上位75%差枚"],
+                stats["上位95%差枚"],
+            ],
+        }
+    ).set_index("分位点")
+    quantiles["収支(円)"] = [exchange.cash(value) for value in quantiles["差枚"]]
+    st.dataframe(
+        quantiles.style.format({"差枚": "{:+,.0f}", "収支(円)": "{:+,.0f}"}), use_container_width=True
+    )
+
+
+# --- 4. 収支管理 -------------------------------------------------------------
+def page_ledger() -> None:
+    st.header("💰 収支管理")
+    st.caption("記録した収支が『勝ち』と言い切れるのか、試行回数が足りないだけなのかを判定します。")
+
+    uploaded = st.file_uploader("収支 CSV", type="csv", key="ledger_csv")
+    if uploaded is not None:
+        frame = pd.read_csv(uploaded)
+    elif "ledger_frame" in st.session_state:
+        frame = st.session_state.ledger_frame
+    else:
+        frame = pd.read_csv(LEDGER_CSV)
+        st.info("サンプルの収支データを表示しています。自分の記録に置き換えてください。", icon="ℹ️")
+
+    edited = st.data_editor(frame, num_rows="dynamic", use_container_width=True, key="ledger_editor")
+    st.session_state.ledger_frame = edited
+
+    if "日付" not in edited.columns:
+        st.error("『日付』列が必要です。テンプレート（data/ledger_sample.csv）の列構成に合わせてください。")
+        return
+
+    records = edited.dropna(subset=["日付"]).to_dict("records")
+    if not records:
+        st.info("1 行以上入力すると集計します。")
+        return
+
+    try:
+        rows = ledger.normalize(records)
+    except (ValueError, KeyError) as error:
+        st.error(f"集計できませんでした: {error}")
+        return
+
+    summary = ledger.summarize(rows)
+    metric_columns = st.columns(4)
+    metric_columns[0].metric("合計収支", f"{summary['合計収支']:+,.0f} 円")
+    metric_columns[1].metric("時給", "—" if math.isnan(summary["時給"]) else f"{summary['時給']:+,.0f} 円")
+    metric_columns[2].metric("勝率", f"{summary['勝率']:.1%}")
+    metric_columns[3].metric("実戦回数", f"{int(summary['件数'])} 回")
+
+    st.subheader("累計収支")
+    running = pd.DataFrame(ledger.cumulative(rows)).set_index("日付")
+    st.area_chart(running["累計収支"])
+
+    left, right = st.columns(2)
+    with left:
+        st.subheader("機種別")
+        st.dataframe(
+            pd.DataFrame(ledger.group_by(rows, "機種")).set_index("機種").style.format(
+                {"件数": "{:.0f}", "合計収支": "{:+,.0f}", "平均収支": "{:+,.0f}", "勝率": "{:.0%}", "時給": "{:+,.0f}"}
+            ),
+            use_container_width=True,
+        )
+    with right:
+        st.subheader("店舗別")
+        st.dataframe(
+            pd.DataFrame(ledger.group_by(rows, "店舗")).set_index("店舗").style.format(
+                {"件数": "{:.0f}", "合計収支": "{:+,.0f}", "平均収支": "{:+,.0f}", "勝率": "{:.0%}", "時給": "{:+,.0f}"}
+            ),
+            use_container_width=True,
+        )
+
+    st.subheader("月次")
+    st.dataframe(
+        pd.DataFrame(ledger.monthly(rows)).set_index("年月").style.format(
+            {"件数": "{:.0f}", "合計収支": "{:+,.0f}", "勝率": "{:.0%}", "時給": "{:+,.0f}"}
+        ),
+        use_container_width=True,
+    )
+
+    st.subheader("その収支、運の範囲内か？")
+    balances = [float(row["収支"]) for row in rows]
+    lower, upper = ledger.bootstrap_ci(balances, trials=5000, seed=0)
+    verdict = ledger.is_profitable(balances, trials=5000, seed=0)
+    needed = ledger.required_sessions(balances)
+
+    if math.isnan(lower):
+        st.info("判定には 2 回以上の記録が必要です。")
+    else:
+        st.write(f"1回あたり平均収支の95%信頼区間: **{lower:+,.0f} 円 〜 {upper:+,.0f} 円**")
+        if verdict is True:
+            st.success("信頼区間がプラス側に収まっています。運だけでは説明しにくい水準です。")
+        elif verdict is False:
+            st.error("信頼区間がマイナス側に収まっています。立ち回りの見直しが必要です。")
+        else:
+            st.warning("信頼区間が 0 を跨いでいます。現時点では勝ちとも負けとも言えません。")
+        if needed is not None:
+            st.caption(f"いまのペースが続く場合、判断がつくまでの目安は約 {needed:,} 回です。")
+
+    st.download_button(
+        "💾 収支CSVをダウンロード",
+        edited.to_csv(index=False).encode("utf-8-sig"),
+        "slot_ledger.csv",
+        "text/csv",
+    )
+
+
+PAGES = {
+    "🎯 設定判別": page_setting_estimation,
+    "⏱ 天井狙い": page_ceiling,
+    "📐 シミュレーション": page_simulation,
+    "💰 収支管理": page_ledger,
+}
+
+
+def main() -> None:
+    st.sidebar.title("🎰 スロット立ち回り支援")
+    choice = st.sidebar.radio("メニュー", list(PAGES))
+    st.sidebar.caption(
+        "解析値はユーザーが用意する前提のツールです。"
+        "同梱データはすべてダミーなので、実戦前に解析サイトの最新値へ差し替えてください。"
+    )
+    PAGES[choice]()
+
+
+if __name__ == "__main__":
+    main()
