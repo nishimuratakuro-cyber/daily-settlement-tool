@@ -4,6 +4,6 @@
 からもそのまま使える。表示層は ``slot/app.py`` 側に閉じ込めている。
 """
 
-from . import bayes, ev, ledger
+from . import bayes, ev, hall, ledger, stats
 
-__all__ = ["bayes", "ev", "ledger"]
+__all__ = ["bayes", "ev", "hall", "ledger", "stats"]

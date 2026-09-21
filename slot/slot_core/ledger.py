@@ -11,12 +11,25 @@ from __future__ import annotations
 
 import csv
 import math
-import random
 from collections.abc import Iterable, Mapping, Sequence
 from datetime import date, datetime
 
-# 95% 信頼区間で使う正規分布の分位点
-Z_95 = 1.959963984540054
+from .stats import Z_95, bootstrap_ci, required_samples, verdict
+
+__all__ = [
+    "Z_95",
+    "TEMPLATE_COLUMNS",
+    "bootstrap_ci",
+    "cumulative",
+    "group_by",
+    "is_profitable",
+    "load",
+    "monthly",
+    "normalize",
+    "parse_date",
+    "required_sessions",
+    "summarize",
+]
 
 DATE_FORMATS = ("%Y-%m-%d", "%Y/%m/%d", "%Y.%m.%d", "%y/%m/%d")
 
@@ -186,33 +199,6 @@ def cumulative(rows: Sequence[Mapping[str, object]]) -> list[dict[str, object]]:
     return result
 
 
-def bootstrap_ci(
-    values: Sequence[float],
-    trials: int = 10_000,
-    alpha: float = 0.05,
-    seed: int | None = None,
-) -> tuple[float, float]:
-    """平均値のブートストラップ信頼区間（パーセンタイル法）。"""
-    if len(values) < 2:
-        return (math.nan, math.nan)
-    if not 0.0 < alpha < 1.0:
-        raise ValueError("alpha は 0〜1 の間にしてください")
-
-    rng = random.Random(seed)
-    size = len(values)
-    means = []
-    for _ in range(trials):
-        total = 0.0
-        for _ in range(size):
-            total += values[rng.randrange(size)]
-        means.append(total / size)
-    means.sort()
-
-    lower_index = int(trials * (alpha / 2))
-    upper_index = min(trials - 1, int(trials * (1 - alpha / 2)))
-    return (means[lower_index], means[upper_index])
-
-
 def is_profitable(
     values: Sequence[float],
     trials: int = 10_000,
@@ -224,32 +210,9 @@ def is_profitable(
     ``True`` なら「勝ちが運では説明しにくい」、``False`` なら「負けが濃厚」、
     ``None`` なら「まだ判断できる試行回数ではない」。
     """
-    lower, upper = bootstrap_ci(values, trials=trials, alpha=alpha, seed=seed)
-    if math.isnan(lower) or math.isnan(upper):
-        return None
-    if lower > 0:
-        return True
-    if upper < 0:
-        return False
-    return None
+    return verdict(bootstrap_ci(values, trials=trials, alpha=alpha, seed=seed))
 
 
 def required_sessions(values: Sequence[float], alpha: float = 0.05) -> int | None:
-    """いまの平均・ばらつきが続いた場合、有意になるのに必要な回数の目安。
-
-    ``n = (z * 標準偏差 / 平均)^2``。平均が 0 に近いと発散するので ``None`` を返す。
-    """
-    if len(values) < 2:
-        return None
-    size = len(values)
-    mean = sum(values) / size
-    if math.isclose(mean, 0.0):
-        return None
-    variance = sum((value - mean) ** 2 for value in values) / (size - 1)
-    sd = math.sqrt(variance)
-    if sd == 0.0:
-        return size
-    needed = (Z_95 * sd / abs(mean)) ** 2
-    if not math.isfinite(needed) or needed > 1e7:
-        return None
-    return max(size, math.ceil(needed))
+    """いまのペースが続いた場合、有意になるのに必要な実戦回数の目安。"""
+    return required_samples(values, alpha=alpha)

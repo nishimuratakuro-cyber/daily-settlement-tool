@@ -18,11 +18,12 @@ import streamlit as st
 
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 
-from slot_core import bayes, ev, ledger  # noqa: E402
+from slot_core import bayes, ev, hall, ledger  # noqa: E402
 
 DATA_DIR = os.path.join(os.path.dirname(os.path.abspath(__file__)), "data")
 MACHINES_CSV = os.path.join(DATA_DIR, "machines_sample.csv")
 LEDGER_CSV = os.path.join(DATA_DIR, "ledger_sample.csv")
+HALL_CSV = os.path.join(DATA_DIR, "hall_sample.csv")
 
 st.set_page_config(page_title="スロット立ち回り支援ツール", page_icon="🎰", layout="wide")
 
@@ -403,11 +404,129 @@ def page_ledger() -> None:
     )
 
 
+# --- 5. ホール傾向分析 -------------------------------------------------------
+def group_table(rows: list[dict], label: str = "区分"):
+    """集計結果を見やすい表にする。"""
+    frame = pd.DataFrame(rows)
+    if frame.empty:
+        return frame
+    frame = frame.rename(columns={"区分": label}).set_index(label)
+    formats = {
+        "台数": "{:,.0f}",
+        "日数": "{:,.0f}",
+        "総回転数": "{:,.0f}",
+        "総差枚": "{:+,.0f}",
+        "機械割": "{:.1%}",
+        "勝ち台率": "{:.0%}",
+        "高設定率": "{:.0%}",
+        "全体との差": "{:+.1%}",
+        "機械割下限": "{:.1%}",
+        "機械割上限": "{:.1%}",
+    }
+    return frame.style.format({key: value for key, value in formats.items() if key in frame.columns})
+
+
+def page_hall() -> None:
+    st.header("🏠 ホール傾向分析")
+    st.caption(
+        "店舗×日付×台番の実績から「どの店の、どの日に、どの機種へ設定を使っているか」を出します。"
+        "通信は一切せず、手元の CSV だけを読みます。"
+    )
+
+    uploaded = st.file_uploader("ホールデータ CSV", type="csv", key="hall_csv")
+    try:
+        if uploaded is not None:
+            reader = csv.DictReader(io.StringIO(uploaded.getvalue().decode("utf-8-sig")))
+            records = hall.parse_rows(reader, fieldnames=reader.fieldnames or [])
+        else:
+            records = hall.load(HALL_CSV)
+            st.info("サンプルを表示中です（生成データであり、実在ホールの記録ではありません）。", icon="ℹ️")
+    except (ValueError, KeyError) as error:
+        st.error(f"読み込めませんでした: {error}")
+        st.caption("必須列は 日付 / 総回転数 / 差枚 の 3 つ。列名のゆらぎ（営業日・G数・差枚数など）は自動で吸収します。")
+        return
+
+    if not records:
+        st.warning("集計できる行がありませんでした。")
+        return
+
+    stores = sorted({record["店舗"] for record in records})
+    machine_names = sorted({record["機種"] for record in records})
+    left, middle, right = st.columns(3)
+    with left:
+        picked_stores = st.multiselect("店舗", stores, default=stores)
+    with middle:
+        picked_machines = st.multiselect("機種", machine_names, default=machine_names)
+    with right:
+        min_games = st.number_input(
+            "最低回転数", min_value=0, max_value=20_000, value=0, step=500,
+            help="これ未満しか回っていない台を除外します。短時間の台は機械割が暴れるため",
+        )
+
+    records = [
+        record
+        for record in records
+        if record["店舗"] in picked_stores
+        and record["機種"] in picked_machines
+        and record["総回転数"] >= min_games
+    ]
+    if not records:
+        st.warning("条件に合う台がありません。フィルタを緩めてください。")
+        return
+
+    summary = hall.summarize(records)
+    metric_columns = st.columns(5)
+    metric_columns[0].metric("機械割", f"{summary['機械割'] * 100:.1f}%")
+    metric_columns[1].metric("勝ち台率", f"{summary['勝ち台率']:.1%}")
+    metric_columns[2].metric(
+        "高設定率", "—" if math.isnan(summary["高設定率"]) else f"{summary['高設定率']:.1%}"
+    )
+    metric_columns[3].metric("台数", f"{int(summary['台数']):,}")
+    metric_columns[4].metric("総差枚", f"{summary['総差枚']:+,.0f}")
+    st.caption(
+        "機械割は台ごとの平均ではなく、総差枚 ÷ 総投入（3枚 × 総回転数）の加重値です。"
+        "高設定率は 2000G 以上回った台のうち機械割 105% 以上だった割合。"
+    )
+
+    st.subheader("日付別の機械割")
+    daily = hall.group_stats(records, "日付")
+    daily_frame = (
+        pd.DataFrame([{"日付": row["区分"], "機械割": row["機械割"]} for row in daily])
+        .sort_values("日付")
+        .set_index("日付")
+    )
+    st.line_chart(daily_frame)
+
+    tabs = st.tabs(["店舗別", "日付パターン", "曜日別", "機種別", "台番末尾", "店舗×日付"])
+    with tabs[0]:
+        st.dataframe(group_table(hall.group_stats(records, "店舗", ci_trials=400, seed=0), "店舗"), use_container_width=True)
+        st.caption("「全体より上」が True の店舗は、差が偶然では説明しにくい水準です。")
+    with tabs[1]:
+        st.dataframe(group_table(hall.special_day_stats(records, ci_trials=400, seed=0), "パターン"), use_container_width=True)
+        st.caption("1 台が複数パターンに属しうるため、パターンごとに母集団を作り直しています。")
+    with tabs[2]:
+        st.dataframe(group_table(hall.group_stats(records, "曜日"), "曜日"), use_container_width=True)
+    with tabs[3]:
+        st.dataframe(group_table(hall.group_stats(records, "機種"), "機種"), use_container_width=True)
+    with tabs[4]:
+        st.dataframe(group_table(hall.group_stats(records, hall.machine_number_digit), "台番末尾"), use_container_width=True)
+    with tabs[5]:
+        ranking = pd.DataFrame(hall.store_day_ranking(records, top=20))
+        st.dataframe(
+            ranking.style.format(
+                {"機械割": "{:.1%}", "高設定率": "{:.0%}", "総差枚": "{:+,.0f}", "台数": "{:,.0f}"}
+            ),
+            use_container_width=True,
+        )
+        st.caption("設定を使った営業日の候補。上位に同じ曜日・日付パターンが並ぶなら、それが狙い目です。")
+
+
 PAGES = {
     "🎯 設定判別": page_setting_estimation,
     "⏱ 天井狙い": page_ceiling,
     "📐 シミュレーション": page_simulation,
     "💰 収支管理": page_ledger,
+    "🏠 ホール傾向分析": page_hall,
 }
 
 
