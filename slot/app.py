@@ -521,12 +521,149 @@ def page_hall() -> None:
         st.caption("設定を使った営業日の候補。上位に同じ曜日・日付パターンが並ぶなら、それが狙い目です。")
 
 
+# --- 6. 手順チェック ---------------------------------------------------------
+# 立ち回り情報で見かける手順。消化ゲーム数は仕様からの推定値で、主張の出所ではない。
+PROCEDURE_PRESETS: dict[str, tuple[float, int] | None] = {
+    "（手入力）": None,
+    "北斗転生2 41G確認のみ（主張107%）": (107.0, 41),
+    "北斗転生2 リセ〜当選まで（主張107%）": (107.0, 270),
+    "東京喰種 朝一〜CZまで（主張103%）": (103.0, 143),
+    "東京喰種 CZ外し〜天国（主張104%）": (104.0, 150),
+    "北斗の拳 朝一0Gから（主張102%）": (102.0, 250),
+    "北斗の拳 100Gから（主張105%）": (105.0, 220),
+    "北斗の拳 200Gから（主張110%）": (110.0, 180),
+    "モンキーターンV 手順全体（主張105%）": (105.0, 200),
+}
+
+
+def page_procedure() -> None:
+    st.header("🧮 手順チェック")
+    st.caption(
+        "「この手順で機械割○%over」という主張を、1台あたりの実額・実効時給・"
+        "交換率別の損益分岐に変換します。率が高くても消化が短ければ実額は小さい、"
+        "という点を見えるようにするためのページです。"
+    )
+
+    preset_name = st.selectbox("プリセット", list(PROCEDURE_PRESETS))
+    preset = PROCEDURE_PRESETS[preset_name]
+    default_rate, default_games = preset if preset else (105.0, 200)
+    if preset:
+        st.caption("消化ゲーム数は機種仕様からの推定値です。実際の平均消化に合わせて調整してください。")
+
+    left, middle, right = st.columns(3)
+    with left:
+        claimed_rate = st.number_input(
+            "主張されている機械割(%)", min_value=50.0, max_value=200.0,
+            value=float(default_rate), step=0.1,
+        )
+        games = st.number_input(
+            "1台あたりの消化ゲーム数", min_value=1, max_value=20_000,
+            value=int(default_games), step=10,
+        )
+    with middle:
+        loss_per_game = st.number_input(
+            "通常時の1Gあたり期待負け枚数", min_value=0.0, max_value=3.0, value=1.72, step=0.01,
+            help="通常時の純減 × 非当選率が目安。純増2枚・的中率15%なら約1.72枚",
+        )
+        games_per_hour = st.number_input(
+            "消化速度(G/h)", min_value=100, max_value=1200, value=600, step=50
+        )
+    with right:
+        overhead = st.number_input(
+            "1台あたりの付帯時間(分)", min_value=0, max_value=60, value=6, step=1,
+            help="台探し・移動・リセット判別にかかる時間。リセ狩りではここが効きます",
+        )
+    exchange = exchange_input("procedure")
+
+    result = ev.procedure_value(
+        claimed_rate,
+        int(games),
+        exchange=exchange,
+        games_per_hour=float(games_per_hour),
+        overhead_minutes=float(overhead),
+        loss_medals_per_game=loss_per_game,
+    )
+
+    metric_columns = st.columns(4)
+    metric_columns[0].metric("期待差枚", f"{result['期待差枚']:+,.1f} 枚")
+    metric_columns[1].metric("1台あたり期待収支", f"{result['期待収支(円)']:+,.0f} 円")
+    metric_columns[2].metric("名目時給", f"{result['名目時給(円)']:+,.0f} 円")
+    metric_columns[3].metric(
+        "実効時給", f"{result['実効時給(円)']:+,.0f} 円",
+        delta=f"付帯{int(overhead)}分込み" if overhead else None,
+    )
+    st.caption(
+        f"拘束時間 {result['拘束時間(分)']:.0f}分（消化 {result['消化時間(分)']:.0f}分 ＋ 付帯 {int(overhead)}分）。"
+        "名目時給は機械割だけで決まるので、実額と実効時給のほうが立ち回りの判断材料になります。"
+    )
+
+    breakeven = result["現金投資の損益分岐機械割"]
+    st.subheader("交換率の影響")
+    if exchange.is_even:
+        st.success("等価なので損益分岐は機械割100%。主張どおりの率が出ていれば期待値はプラスです。")
+    else:
+        st.write(
+            f"現金投資でこなす場合の損益分岐機械割: **{breakeven * 100:.1f}%**"
+            f"（貸出 {exchange.rental_yen:.2f}円 / 換金 {exchange.payout_yen:.2f}円）"
+        )
+        if result["損益分岐との差"] >= 0:
+            st.success(
+                f"主張の {claimed_rate:.1f}% は損益分岐を {result['損益分岐との差'] * 100:+.1f}pt 上回っています。"
+            )
+        else:
+            st.error(
+                f"主張の {claimed_rate:.1f}% は損益分岐に {result['損益分岐との差'] * 100:.1f}pt 届きません。"
+                "現金投資では成立せず、貯メダル・持ちメダルでこなす必要があります。"
+            )
+        st.caption(
+            "メダルは機械内で循環するので、現金で買うのは負けた分だけ。"
+            "負け分は貸出単価・勝ち分は換金単価という非対称性が、非等価のペナルティの正体です。"
+            "貯メダル／持ちメダル遊技なら単価差が無いので損益分岐は100%に戻ります。"
+        )
+
+    st.subheader("機械割と時給の対応")
+    rates = [1.00, 1.02, 1.03, 1.04, 1.05, 1.07, 1.10]
+    table = pd.DataFrame(
+        {
+            "機械割": rates,
+            "名目時給(円)": [
+                ev.hourly_from_payout_rate(rate, float(games_per_hour), exchange=exchange)
+                for rate in rates
+            ],
+            "この消化Gでの実額(円)": [
+                3 * int(games) * (rate - 1) * exchange.payout_yen for rate in rates
+            ],
+        }
+    ).set_index("機械割")
+    st.dataframe(
+        table.style.format({"名目時給(円)": "{:+,.0f}", "この消化Gでの実額(円)": "{:+,.0f}"}),
+        use_container_width=True,
+    )
+    st.caption("等価・600G/h なら 時給 = 36,000 × (機械割 − 1)。小数点以下を36,000倍すれば時給になります。")
+
+    if not exchange.is_even:
+        st.subheader("負け枚数別の損益分岐（現金投資）")
+        losses = [1.0, 1.5, 1.72, 2.0, 2.5, 3.0]
+        st.dataframe(
+            pd.DataFrame(
+                {
+                    "1Gあたり負け枚数": losses,
+                    "損益分岐機械割": [
+                        ev.breakeven_payout_rate(exchange, loss) for loss in losses
+                    ],
+                }
+            ).set_index("1Gあたり負け枚数").style.format({"損益分岐機械割": "{:.1%}"}),
+            use_container_width=True,
+        )
+
+
 PAGES = {
     "🎯 設定判別": page_setting_estimation,
     "⏱ 天井狙い": page_ceiling,
     "📐 シミュレーション": page_simulation,
     "💰 収支管理": page_ledger,
     "🏠 ホール傾向分析": page_hall,
+    "🧮 手順チェック": page_procedure,
 }
 
 

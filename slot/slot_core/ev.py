@@ -322,3 +322,93 @@ def breakeven_start_games(model: CeilingModel, step: int = 1) -> int | None:
         if ceiling_ev(model, games)["期待差枚"] >= 0:
             return games
     return None
+
+def hourly_from_payout_rate(
+    payout_rate: float,
+    games_per_hour: float = 600.0,
+    medals_per_game: float = 3.0,
+    exchange: Exchange | None = None,
+) -> float:
+    """機械割から時給（円）を出す。
+
+    等価・600G/h なら ``36,000 × (機械割 − 1)``。機械割の小数点以下を 36,000 倍すれば
+    時給になる、という換算がそのまま使える。
+    """
+    if payout_rate > 5.0:  # 105 のような百分率で渡された場合
+        payout_rate = payout_rate / 100.0
+    if payout_rate <= 0:
+        raise ValueError("機械割は正の値にしてください")
+    exchange = exchange or Exchange()
+    diff_per_hour = medals_per_game * games_per_hour * (payout_rate - 1.0)
+    return diff_per_hour * exchange.payout_yen
+
+
+def breakeven_payout_rate(
+    exchange: Exchange,
+    loss_medals_per_game: float,
+    medals_per_game: float = 3.0,
+) -> float:
+    """現金投資でこなす区間の、損益分岐となる機械割。
+
+    メダルは機械内で循環するので、現金で買うのは負けた分だけ。よって
+
+        EV = 換金単価 × E[差枚] − (貸出単価 − 換金単価) × E[負け枚数]
+
+    これを 0 にする機械割を返す。``loss_medals_per_game`` はその区間の
+    1 ゲームあたり期待負け枚数（通常時の純減 × 非当選率が目安）。
+
+    等価、または貯メダル・持ちメダルでこなす場合は単価差が無いので 1.0 を返す。
+    """
+    if loss_medals_per_game < 0:
+        raise ValueError("負け枚数は 0 以上にしてください")
+    gap = exchange.rental_yen - exchange.payout_yen
+    if gap <= 0:
+        return 1.0
+    return 1.0 + (gap / exchange.payout_yen) * loss_medals_per_game / medals_per_game
+
+
+def procedure_value(
+    payout_rate: float,
+    games: float,
+    exchange: Exchange | None = None,
+    medals_per_game: float = 3.0,
+    games_per_hour: float = 600.0,
+    overhead_minutes: float = 0.0,
+    loss_medals_per_game: float | None = None,
+) -> dict[str, float]:
+    """「機械割○%の手順」を 1 台あたりの実額と実効時給に変換する。
+
+    立ち回り情報で語られる機械割は区間の比率なので、消化ゲーム数が短いと
+    率が高くても実額は小さい。台探し・移動・判別にかかる ``overhead_minutes``
+    を入れた実効時給まで出して、その差を見えるようにする。
+    """
+    if payout_rate > 5.0:
+        payout_rate = payout_rate / 100.0
+    if games <= 0:
+        raise ValueError("消化ゲーム数は 1 以上にしてください")
+    if overhead_minutes < 0:
+        raise ValueError("付帯時間は 0 以上にしてください")
+    exchange = exchange or Exchange()
+
+    inserted = medals_per_game * games
+    diff = inserted * (payout_rate - 1.0)
+    play_minutes = games / games_per_hour * 60.0
+    total_minutes = play_minutes + overhead_minutes
+
+    result = {
+        "機械割": payout_rate,
+        "投入枚数": inserted,
+        "期待差枚": diff,
+        "期待収支(円)": diff * exchange.payout_yen,
+        "消化時間(分)": play_minutes,
+        "拘束時間(分)": total_minutes,
+        "名目時給(円)": hourly_from_payout_rate(
+            payout_rate, games_per_hour, medals_per_game, exchange
+        ),
+        "実効時給(円)": diff * exchange.payout_yen * 60.0 / total_minutes,
+    }
+    if loss_medals_per_game is not None:
+        breakeven = breakeven_payout_rate(exchange, loss_medals_per_game, medals_per_game)
+        result["現金投資の損益分岐機械割"] = breakeven
+        result["損益分岐との差"] = payout_rate - breakeven
+    return result
