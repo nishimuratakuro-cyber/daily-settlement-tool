@@ -619,7 +619,12 @@ def page_procedure() -> None:
     preset = PROCEDURE_PRESETS[preset_name]
     default_rate, default_games = preset if preset else (105.0, 200)
     if preset:
-        st.caption("消化ゲーム数は機種仕様からの推定値です。実際の平均消化に合わせて調整してください。")
+        st.caption(
+            "消化ゲーム数は機種仕様からの推定値です。実際の平均消化に合わせて調整してください。"
+            "天国やゾーンのある機種は当選が前方に寄るため、ハザード一定で見積もるより"
+            "13〜27%ほど消化が短くなります（そのぶん実効時給は上がります）。"
+            "正確に出すなら「⏱ 天井狙い」のゾーン考慮モードで期待消化ゲーム数を確認してください。"
+        )
 
     left, middle, right = st.columns(3)
     with left:
