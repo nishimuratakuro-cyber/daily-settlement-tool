@@ -11,7 +11,7 @@ from __future__ import annotations
 
 import math
 import random
-from collections.abc import Sequence
+from collections.abc import Callable, Sequence
 from dataclasses import dataclass
 
 DEFAULT_TRIALS = 20_000
@@ -412,3 +412,158 @@ def procedure_value(
         result["現金投資の損益分岐機械割"] = breakeven
         result["損益分岐との差"] = payout_rate - breakeven
     return result
+
+def zone_hazard(
+    base_probability: float,
+    heaven_games: int = 0,
+    heaven_multiplier: float = 1.0,
+    zone_every: int = 0,
+    zone_multiplier: float = 1.0,
+) -> Callable[[int], float]:
+    """実機によくある「天国＋規定ゲーム数ゾーン」形のハザード関数を組む。
+
+    ``heaven_games`` ゲームまでは ``heaven_multiplier`` 倍、``zone_every`` の倍数の
+    ゲームでは ``zone_multiplier`` 倍、それ以外は ``base_probability`` そのまま。
+
+    全体の当選率を実機に合わせたい場合は :func:`calibrate_hazard` を通す。
+    """
+    if not 0.0 < base_probability < 1.0:
+        raise ValueError("基準確率は 0 < p < 1 にしてください")
+    if heaven_games < 0 or zone_every < 0:
+        raise ValueError("ゲーム数は 0 以上にしてください")
+    if heaven_multiplier <= 0 or zone_multiplier <= 0:
+        raise ValueError("倍率は正の値にしてください")
+
+    def hazard(game: int) -> float:
+        probability = base_probability
+        if heaven_games and game <= heaven_games:
+            probability *= heaven_multiplier
+        elif zone_every and game % zone_every == 0:
+            probability *= zone_multiplier
+        return min(probability, 1.0)
+
+    return hazard
+
+
+def _hazard_value(hazard: Callable[[int], float] | Sequence[float], game: int) -> float:
+    """ハザードを関数でも配列でも受け取れるようにする。"""
+    if callable(hazard):
+        value = hazard(game)
+    else:
+        index = game - 1
+        value = hazard[index] if 0 <= index < len(hazard) else 0.0
+    return min(max(float(value), 0.0), 1.0)
+
+
+def total_hit_probability(
+    hazard: Callable[[int], float] | Sequence[float],
+    ceiling_games: int,
+    current_games: int = 0,
+) -> float:
+    """``current_games`` から天井までに自力当選する確率。"""
+    survive = 1.0
+    for game in range(current_games + 1, ceiling_games + 1):
+        survive *= 1.0 - _hazard_value(hazard, game)
+    return 1.0 - survive
+
+
+def calibrate_hazard(
+    builder: Callable[[float], Callable[[int], float]],
+    target_hit_probability: float,
+    ceiling_games: int,
+    iterations: int = 80,
+) -> Callable[[int], float]:
+    """自力当選率が実機の値に一致するよう、ハザード全体のスケールを合わせる。
+
+    ``builder`` は基準確率を受け取ってハザード関数を返す呼び出し可能オブジェクト。
+    ゾーンの形は保ったまま、全体の当選率だけを合わせられる。
+    """
+    if not 0.0 < target_hit_probability < 1.0:
+        raise ValueError("目標当選率は 0 < p < 1 にしてください")
+    low, high = 1e-9, 1.0
+    for _ in range(iterations):
+        middle = (low + high) / 2
+        if total_hit_probability(builder(middle), ceiling_games) < target_hit_probability:
+            low = middle
+        else:
+            high = middle
+    return builder((low + high) / 2)
+
+
+def hazard_ceiling_ev(
+    hazard: Callable[[int], float] | Sequence[float],
+    ceiling_games: int,
+    current_games: int = 0,
+    average_payout: float = 0.0,
+    ceiling_payout: float = 0.0,
+    net_loss_per_game: float = 2.0,
+    exchange: Exchange | None = None,
+) -> dict[str, float]:
+    """ゲームごとの当選確率を与えて、天井狙いの期待値を厳密に計算する。
+
+    :func:`ceiling_ev` はハザード一定を仮定した閉じた式だが、天国やゾーンのある機種では
+    その近似が大きくずれる。当選が前方に寄った機種では浅いゲーム数の期待値を過小評価し、
+    ゾーンを通過した直後では逆に過大評価する（ズレの符号が変わる）。
+    ゾーンが効く機種ではこちらを使う。
+    """
+    if ceiling_games <= 0:
+        raise ValueError("天井ゲーム数は 1 以上にしてください")
+    if current_games < 0 or current_games > ceiling_games:
+        raise ValueError("現在ゲーム数は 0 以上、天井以下にしてください")
+    exchange = exchange or Exchange()
+
+    survive = 1.0
+    expected_games = 0.0
+    self_hit = 0.0
+    for game in range(current_games + 1, ceiling_games + 1):
+        probability = _hazard_value(hazard, game)
+        expected_games += survive * probability * (game - current_games)
+        self_hit += survive * probability
+        survive *= 1.0 - probability
+    expected_games += survive * (ceiling_games - current_games)
+
+    invested = expected_games * net_loss_per_game
+    expected_gain = self_hit * average_payout + survive * ceiling_payout
+    diff = expected_gain - invested
+
+    return {
+        "残りゲーム数": float(ceiling_games - current_games),
+        "自力当選率": self_hit,
+        "天井到達率": survive,
+        "期待消化ゲーム数": expected_games,
+        "期待投資枚数": invested,
+        "期待獲得枚数": expected_gain,
+        "期待差枚": diff,
+        "期待収支(円)": diff * exchange.payout_yen,
+    }
+
+
+def hazard_breakeven_start_games(
+    hazard: Callable[[int], float] | Sequence[float],
+    ceiling_games: int,
+    average_payout: float,
+    ceiling_payout: float,
+    net_loss_per_game: float = 2.0,
+    step: int = 1,
+) -> int | None:
+    """ゾーンを考慮した狙い目ライン。
+
+    ゾーンのある機種では期待値がゲーム数に対して単調に増えないので、
+    最初にプラスへ転じる点ではなく、**そこから天井まで一度もマイナスに戻らない**
+    最小のゲーム数を返す。見つからなければ ``None``。
+    """
+    if step <= 0:
+        raise ValueError("step は 1 以上にしてください")
+    candidates = list(range(0, ceiling_games, step))
+    answer: int | None = None
+    for games in reversed(candidates):
+        value = hazard_ceiling_ev(
+            hazard, ceiling_games, games,
+            average_payout=average_payout, ceiling_payout=ceiling_payout,
+            net_loss_per_game=net_loss_per_game,
+        )["期待差枚"]
+        if value >= 0:
+            answer = games
+        else:
+            break
+    return answer
