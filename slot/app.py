@@ -176,7 +176,9 @@ def page_setting_estimation() -> None:
 def page_ceiling() -> None:
     st.header("⏱ 天井狙いの期待値")
     st.caption(
-        "通常時の当選率を一定とみなす近似モデルです。ゾーンやモードが濃い機種ほど誤差が出ます。"
+        "ゾーンの無い機種ならハザード一定の式で足りますが、天国や規定ゲーム数ゾーンのある機種では"
+        "その近似が大きくずれます（狙い目ラインが100G以上変わることがあります）。"
+        "ゾーンが効く機種は下のチェックを入れてください。"
     )
 
     left, right = st.columns(2)
@@ -193,17 +195,70 @@ def page_ceiling() -> None:
             "コイン持ち（50枚あたりのゲーム数）", min_value=1.0, max_value=100.0, value=25.0, step=0.5
         )
     exchange = exchange_input("ceiling")
+    net_loss = 50.0 / coin_persistence
+
+    use_zones = st.checkbox(
+        "ゾーン構造を考慮する（天国・規定ゲーム数ゾーンのある機種）", value=False, key="ceiling_zones"
+    )
+    hazard = None
+    if use_zones:
+        zone_columns = st.columns(4)
+        with zone_columns[0]:
+            heaven_games = st.number_input("天国のゲーム数", min_value=0, max_value=500, value=32, step=1)
+        with zone_columns[1]:
+            heaven_multiplier = st.number_input(
+                "天国の当選率倍率", min_value=1.0, max_value=100.0, value=20.0, step=1.0
+            )
+        with zone_columns[2]:
+            zone_every = st.number_input("ゾーンの間隔(G)", min_value=0, max_value=1000, value=100, step=10)
+        with zone_columns[3]:
+            zone_multiplier = st.number_input(
+                "ゾーンの当選率倍率", min_value=1.0, max_value=100.0, value=10.0, step=1.0
+            )
+        # 全体の自力当選率は一定モデルと揃えたまま、当選の偏りだけを入れる
+        target = ev.total_hit_probability(lambda game: hit_probability, int(ceiling_games))
+        try:
+            hazard = ev.calibrate_hazard(
+                lambda base: ev.zone_hazard(
+                    base,
+                    heaven_games=int(heaven_games), heaven_multiplier=heaven_multiplier,
+                    zone_every=int(zone_every), zone_multiplier=zone_multiplier,
+                ),
+                target, int(ceiling_games),
+            )
+        except ValueError as error:
+            st.error(f"ゾーン設定を解釈できませんでした: {error}")
+            return
+        st.caption(
+            f"全体の自力当選率を {target:.1%} に揃えたまま、当選の偏りだけを入れています。"
+            "倍率は実機の解析値に合わせてください。"
+        )
 
     model = ev.CeilingModel(
         ceiling_games=int(ceiling_games),
         hit_probability=hit_probability,
         average_payout=average_payout,
         ceiling_payout=ceiling_payout,
-        net_loss_per_game=50.0 / coin_persistence,
+        net_loss_per_game=net_loss,
     )
-    result = ev.ceiling_ev(model, int(current_games), exchange=exchange)
-    breakeven = ev.breakeven_start_games(model)
+    flat_result = ev.ceiling_ev(model, int(current_games), exchange=exchange)
+    flat_line = ev.breakeven_start_games(model)
+    step = max(1, int(ceiling_games) // 100)
 
+    if hazard is None:
+        result, breakeven, label = flat_result, flat_line, "ハザード一定"
+    else:
+        result = ev.hazard_ceiling_ev(
+            hazard, int(ceiling_games), int(current_games),
+            average_payout=average_payout, ceiling_payout=ceiling_payout,
+            net_loss_per_game=net_loss, exchange=exchange,
+        )
+        breakeven = ev.hazard_breakeven_start_games(
+            hazard, int(ceiling_games), average_payout, ceiling_payout, net_loss, step=step
+        )
+        label = "ゾーン考慮"
+
+    st.subheader(f"判定（{label}）")
     metric_columns = st.columns(4)
     metric_columns[0].metric("期待差枚", f"{result['期待差枚']:+,.0f} 枚")
     metric_columns[1].metric("期待収支", f"{result['期待収支(円)']:+,.0f} 円")
@@ -219,25 +274,41 @@ def page_ceiling() -> None:
     else:
         st.warning(f"期待値がプラスになるのは {breakeven:,}G から。現在 {int(current_games):,}G では見送りです。")
 
+    if hazard is not None:
+        gap = result["期待差枚"] - flat_result["期待差枚"]
+        st.info(
+            f"ハザード一定の式だと {flat_result['期待差枚']:+,.0f}枚 "
+            f"／狙い目ライン {'なし' if flat_line is None else f'{flat_line:,}G'} と出ます。"
+            f"ゾーンを考慮すると期待差枚は {gap:+,.0f}枚 ずれます。",
+            icon="⚠️",
+        )
+        st.caption(
+            "ゾーン考慮の狙い目ラインは「最初にプラスになる点」ではなく"
+            "「天井まで一度もマイナスに戻らない最小のゲーム数」です。"
+            "ゾーンがあると期待値がゲーム数に対して単調に増えないためです。"
+        )
+
     detail = pd.DataFrame(
-        {
-            "項目": list(result),
-            "値": [result[key] for key in result],
-        }
+        {"項目": list(result), "値": [result[key] for key in result]}
     ).set_index("項目")
     st.dataframe(detail.style.format({"値": "{:,.2f}"}), use_container_width=True)
 
-    step = max(1, int(ceiling_games) // 100)
-    curve = pd.DataFrame(
-        {
-            "現在ゲーム数": list(range(0, int(ceiling_games), step)),
-            "期待差枚": [
-                ev.ceiling_ev(model, games)["期待差枚"] for games in range(0, int(ceiling_games), step)
-            ],
-        }
-    ).set_index("現在ゲーム数")
     st.subheader("ゲーム数別の期待差枚")
+    points = list(range(0, int(ceiling_games), step))
+    series = {"ハザード一定": [ev.ceiling_ev(model, games)["期待差枚"] for games in points]}
+    if hazard is not None:
+        series["ゾーン考慮"] = [
+            ev.hazard_ceiling_ev(
+                hazard, int(ceiling_games), games,
+                average_payout=average_payout, ceiling_payout=ceiling_payout,
+                net_loss_per_game=net_loss,
+            )["期待差枚"]
+            for games in points
+        ]
+    curve = pd.DataFrame({"現在ゲーム数": points, **series}).set_index("現在ゲーム数")
     st.line_chart(curve)
+    if hazard is not None:
+        st.caption("2本の線の差が近似誤差です。開始ゲーム数によって符号が反転する点に注意してください。")
 
 
 # --- 3. シミュレーション -----------------------------------------------------
