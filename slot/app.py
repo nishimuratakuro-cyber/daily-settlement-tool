@@ -56,7 +56,13 @@ def exchange_input(key_prefix: str) -> ev.Exchange:
 def probability_input(label: str, default_denominator: float, key: str) -> float:
     """1/N 形式で確率を入力させる。"""
     denominator = st.number_input(
-        label, min_value=1.0, max_value=100_000.0, value=default_denominator, step=1.0, key=key
+        label,
+        min_value=2.0,
+        max_value=100_000.0,
+        value=default_denominator,
+        step=1.0,
+        key=key,
+        help="1/N の N を入れます。N=1 は確率1.0になり計算が成立しないため下限は 2 です",
     )
     return 1.0 / denominator
 
@@ -186,7 +192,11 @@ def page_ceiling() -> None:
         ceiling_games = st.number_input("天井ゲーム数", min_value=1, max_value=10_000, value=1000, step=50)
         hit_probability = probability_input("通常時の当選確率 1/N", 300.0, "ceiling_hit")
         current_games = st.number_input(
-            "現在のゲーム数", min_value=0, max_value=int(ceiling_games), value=700, step=10
+            "現在のゲーム数",
+            min_value=0,
+            max_value=int(ceiling_games),
+            value=min(700, int(ceiling_games)),
+            step=10,
         )
     with right:
         average_payout = st.number_input("自力当選時の平均獲得枚数", min_value=0.0, value=500.0, step=50.0)
@@ -234,15 +244,19 @@ def page_ceiling() -> None:
             "倍率は実機の解析値に合わせてください。"
         )
 
-    model = ev.CeilingModel(
-        ceiling_games=int(ceiling_games),
-        hit_probability=hit_probability,
-        average_payout=average_payout,
-        ceiling_payout=ceiling_payout,
-        net_loss_per_game=net_loss,
-    )
-    flat_result = ev.ceiling_ev(model, int(current_games), exchange=exchange)
-    flat_line = ev.breakeven_start_games(model)
+    try:
+        model = ev.CeilingModel(
+            ceiling_games=int(ceiling_games),
+            hit_probability=hit_probability,
+            average_payout=average_payout,
+            ceiling_payout=ceiling_payout,
+            net_loss_per_game=net_loss,
+        )
+        flat_result = ev.ceiling_ev(model, int(current_games), exchange=exchange)
+        flat_line = ev.breakeven_start_games(model)
+    except ValueError as error:
+        st.error(f"入力値では計算できません: {error}")
+        return
     step = max(1, int(ceiling_games) // 100)
 
     if hazard is None:
@@ -332,14 +346,18 @@ def page_simulation() -> None:
     trials = st.slider("試行回数", min_value=1_000, max_value=50_000, value=20_000, step=1_000)
     seed = st.number_input("乱数シード（同じ値なら結果が再現します）", min_value=0, value=42, step=1)
 
-    model = ev.SessionModel(
-        hit_probability=hit_probability,
-        average_payout=average_payout,
-        payout_sd=payout_sd,
-        net_loss_per_game=50.0 / coin_persistence,
-    )
-    diffs = ev.simulate_diffs(model, int(normal_games), trials=int(trials), seed=int(seed))
-    stats = ev.session_stats(diffs, exchange=exchange, bankroll_yen=bankroll or None)
+    try:
+        model = ev.SessionModel(
+            hit_probability=hit_probability,
+            average_payout=average_payout,
+            payout_sd=payout_sd,
+            net_loss_per_game=50.0 / coin_persistence,
+        )
+        diffs = ev.simulate_diffs(model, int(normal_games), trials=int(trials), seed=int(seed))
+        stats = ev.session_stats(diffs, exchange=exchange, bankroll_yen=bankroll or None)
+    except ValueError as error:
+        st.error(f"入力値では計算できません: {error}")
+        return
 
     metric_columns = st.columns(4)
     metric_columns[0].metric("期待差枚", f"{stats['期待差枚']:+,.0f} 枚")
