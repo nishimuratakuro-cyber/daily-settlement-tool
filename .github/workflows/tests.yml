@@ -1,0 +1,19 @@
+name: tests
+
+on:
+  push:
+    branches: ["**"]
+  pull_request:
+
+jobs:
+  unittest:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+      - name: slot_core の単体テスト（追加依存なし）
+        run: python -m unittest discover -s slot/tests -p "test_*.py" -v
+      - name: 構文チェック
+        run: python -m compileall -q app.py slot
